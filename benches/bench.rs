@@ -1,10 +1,10 @@
 use core::{f64, hint::black_box};
 use criterion::{Criterion, criterion_group, criterion_main};
-use std::{io::Write, time::Duration};
+use std::io::Write;
 
 fn _bench(c: &mut Criterion, name: &str, v: f64) {
     let mut group = c.benchmark_group(name);
-    group.measurement_time(Duration::from_secs(20));
+    group.measurement_time(std::time::Duration::from_secs(20));
 
     group.bench_function("xjb", |b| {
         let mut buf = [0; 33];

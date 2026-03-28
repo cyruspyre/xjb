@@ -10,7 +10,6 @@ use core::arch::x86_64::{
 };
 
 use core::hint::select_unpredictable;
-use std::arch::x86_64::{_mm_mullo_epi32, _mm_set1_epi32, _mm_srli_epi32, _mm_sub_epi32};
 
 #[cfg(target_endian = "big")]
 const _: () = compile_error!("big-endian not supported");
@@ -304,87 +303,6 @@ struct ShortestAscii8 {
     dec_sig_len: u64,
 }
 
-#[inline(always)]
-unsafe fn to_ascii16(buf: *mut u8, m: u64, up_down: u64, d17: u64) -> ShortestAscii16 {
-    let abcdefgh =
-        ((m as u128 * CONSTANTS_DOUBLE.mul_const as u128 >> 64) as u64 >> (90 - 64)) as u32;
-    let ijklmnop =
-        m.wrapping_add((abcdefgh as i64 * CONSTANTS_DOUBLE.hundred_million) as u64) as u32;
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        let x = _mm_unpacklo_epi64(
-            _mm_cvtsi32_si128(abcdefgh as _),
-            _mm_cvtsi32_si128(ijklmnop as _),
-        );
-        let y = _mm_add_epi64(
-            x,
-            _mm_mul_epu32(
-                _mm_set1_epi64x((1 << 32) - 10000),
-                _mm_srli_epi64(_mm_mul_epu32(x, _mm_set1_epi64x(109951163)), 40),
-            ),
-        );
-
-        let y_div_100 = _mm_srli_epi16(_mm_mulhi_epu16(y, _mm_set1_epi16(0x147B)), 3);
-        let y_mod_100 = _mm_sub_epi16(y, _mm_mullo_epi16(y_div_100, _mm_set1_epi16(100)));
-        let z = _mm_or_si128(y_div_100, _mm_slli_epi32(y_mod_100, 16));
-
-        let z_div_10 = _mm_mulhi_epu16(z, _mm_set1_epi16(0x199A));
-        let bcd_swapped = _mm_sub_epi16(
-            _mm_slli_epi16(z, 8),
-            _mm_mullo_epi16(_mm_set1_epi16(2559), z_div_10),
-        );
-        let le_bcd = _mm_shuffle_epi32(bcd_swapped, 0b1011_0001); // 0b1011_0001: _MM_SHUFFLE(2, 3, 0, 1)
-
-        let mask = _mm_movemask_epi8(_mm_cmpgt_epi8(le_bcd, _mm_setzero_si128())) as u32 as u64;
-        let tz = mask.leading_zeros() as u64;
-        let ascii16 = _mm_add_epi8(le_bcd, _mm_set1_epi8('0' as _));
-
-        _mm_storeu_si128(buf.cast(), _mm_set1_epi8('0' as _));
-        _mm_storeu_si128(buf.add(16).cast(), _mm_set1_epi8('0' as _));
-
-        return ShortestAscii16 {
-            ascii16,
-            dec_sig_len: select_unpredictable(up_down != 0, 63 - tz, 15 + d17),
-        };
-    }
-
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let abcd_efgh =
-            abcdefgh as u64 + (0x100000000 - 10000) * ((abcdefgh as u64 * 0x68D_B8BB) >> 40);
-        let ijkl_mnop =
-            ijklmnop as u64 + (0x100000000 - 10000) * ((ijklmnop as u64 * 0x68D_B8BB) >> 40);
-        let ab_cd_ef_gh =
-            abcd_efgh + (0x10000 - 100) * (((abcd_efgh * 0x147B) >> 19) & 0x007F_0000_007F);
-        let ij_kl_mn_op =
-            ijkl_mnop + (0x10000 - 100) * (((ijkl_mnop * 0x147B) >> 19) & 0x007F_0000_007F);
-        let a_b_c_d_e_f_g_h =
-            ab_cd_ef_gh + (0x100 - 10) * (((ab_cd_ef_gh * 0x67) >> 10) & 0x000F_000F_000F_000F);
-        let i_j_k_l_m_n_o_p =
-            ij_kl_mn_op + (0x100 - 10) * (((ij_kl_mn_op * 0x67) >> 10) & 0x000F_000F_000F_000F);
-        let abcdefgh_tz = a_b_c_d_e_f_g_h.trailing_zeros();
-        let ijklmnop_tz = i_j_k_l_m_n_o_p.trailing_zeros();
-        let abcdefgh_bcd = a_b_c_d_e_f_g_h.swap_bytes();
-        let ijklmnop_bcd = i_j_k_l_m_n_o_p.swap_bytes();
-        let tz = if ijklmnop == 0 {
-            64 + abcdefgh_tz
-        } else {
-            ijklmnop_tz
-        } / 8;
-
-        buf.cast::<u64>().write_unaligned(ZERO);
-        buf.add(8).cast::<u64>().write_unaligned(ZERO);
-        buf.add(16).cast::<u64>().write_unaligned(ZERO);
-        buf.add(24).cast::<u64>().write_unaligned(ZERO);
-
-        ShortestAscii16 {
-            ascii16: (abcdefgh_bcd | ZERO, ijklmnop_bcd | ZERO),
-            dec_sig_len: select_unpredictable(up_down != 0, 15 - tz as u64, 15 + d17),
-        }
-    }
-}
-
 #[unsafe(no_mangle)]
 pub unsafe fn xjb64(v: f64, mut buf: *mut u8) -> usize {
     let bits = v.to_bits();
@@ -486,15 +404,12 @@ pub unsafe fn xjb64(v: f64, mut buf: *mut u8) -> usize {
 
     let e10_3 = (e10 + -e10_dn) as u64;
     let e10_data_ofs = e10_3.min(interval);
-    let (first_sig_pos, dot_pos, move_pos, mut exp_pos) = {
-        let tmp = DOUBLE_TABLE.e10_variable_data[e10_data_ofs as usize];
-        (
-            tmp[17],
-            tmp[18],
-            tmp[19],
-            *tmp.as_ptr().add(s.dec_sig_len as usize),
-        )
-    };
+    let first_sig_pos = DOUBLE_TABLE.e10_variable_data[e10_data_ofs as usize][17];
+    let dot_pos = DOUBLE_TABLE.e10_variable_data[e10_data_ofs as usize][18];
+    let move_pos = DOUBLE_TABLE.e10_variable_data[e10_data_ofs as usize][19];
+    let mut exp_pos = *DOUBLE_TABLE.e10_variable_data[e10_data_ofs as usize]
+        .as_ptr()
+        .add(s.dec_sig_len as usize);
     let buf_origin = buf;
 
     buf = buf.add(first_sig_pos as _);
@@ -535,6 +450,7 @@ pub unsafe fn xjb64(v: f64, mut buf: *mut u8) -> usize {
     is_neg + exp_len as usize + buf.offset_from_unsigned(buf_origin)
 }
 
+#[unsafe(no_mangle)]
 pub unsafe fn xjb32(v: f32, mut buf: *mut u8) -> usize {
     let bits = v.to_bits();
     let is_neg = (bits >> 31) as usize;
@@ -691,5 +607,86 @@ unsafe fn to_ascii8(m: u64, up_down: u32, lz: u32) -> ShortestAscii8 {
     ShortestAscii8 {
         ascii: (abcdefgh_bcd >> (lz << 3)) | ZERO,
         dec_sig_len: select_unpredictable(up_down != 0, ((7 ^ lz) - tz) as u64, 8 - lz as u64),
+    }
+}
+
+#[inline(always)]
+unsafe fn to_ascii16(buf: *mut u8, m: u64, up_down: u64, d17: u64) -> ShortestAscii16 {
+    let abcdefgh =
+        ((m as u128 * CONSTANTS_DOUBLE.mul_const as u128 >> 64) as u64 >> (90 - 64)) as u32;
+    let ijklmnop =
+        m.wrapping_add((abcdefgh as i64 * CONSTANTS_DOUBLE.hundred_million) as u64) as u32;
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        let x = _mm_unpacklo_epi64(
+            _mm_cvtsi32_si128(abcdefgh as _),
+            _mm_cvtsi32_si128(ijklmnop as _),
+        );
+        let y = _mm_add_epi64(
+            x,
+            _mm_mul_epu32(
+                _mm_set1_epi64x((1 << 32) - 10000),
+                _mm_srli_epi64(_mm_mul_epu32(x, _mm_set1_epi64x(109951163)), 40),
+            ),
+        );
+
+        let y_div_100 = _mm_srli_epi16(_mm_mulhi_epu16(y, _mm_set1_epi16(0x147B)), 3);
+        let y_mod_100 = _mm_sub_epi16(y, _mm_mullo_epi16(y_div_100, _mm_set1_epi16(100)));
+        let z = _mm_or_si128(y_div_100, _mm_slli_epi32(y_mod_100, 16));
+
+        let z_div_10 = _mm_mulhi_epu16(z, _mm_set1_epi16(0x199A));
+        let bcd_swapped = _mm_sub_epi16(
+            _mm_slli_epi16(z, 8),
+            _mm_mullo_epi16(_mm_set1_epi16(2559), z_div_10),
+        );
+        let le_bcd = _mm_shuffle_epi32(bcd_swapped, 0b1011_0001); // 0b1011_0001: _MM_SHUFFLE(2, 3, 0, 1)
+
+        let mask = _mm_movemask_epi8(_mm_cmpgt_epi8(le_bcd, _mm_setzero_si128())) as u32 as u64;
+        let tz = mask.leading_zeros() as u64;
+        let ascii16 = _mm_add_epi8(le_bcd, _mm_set1_epi8('0' as _));
+
+        _mm_storeu_si128(buf.cast(), _mm_set1_epi8('0' as _));
+        _mm_storeu_si128(buf.add(16).cast(), _mm_set1_epi8('0' as _));
+
+        return ShortestAscii16 {
+            ascii16,
+            dec_sig_len: select_unpredictable(up_down != 0, 63 - tz, 15 + d17),
+        };
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let abcd_efgh =
+            abcdefgh as u64 + (0x100000000 - 10000) * ((abcdefgh as u64 * 0x68D_B8BB) >> 40);
+        let ijkl_mnop =
+            ijklmnop as u64 + (0x100000000 - 10000) * ((ijklmnop as u64 * 0x68D_B8BB) >> 40);
+        let ab_cd_ef_gh =
+            abcd_efgh + (0x10000 - 100) * (((abcd_efgh * 0x147B) >> 19) & 0x007F_0000_007F);
+        let ij_kl_mn_op =
+            ijkl_mnop + (0x10000 - 100) * (((ijkl_mnop * 0x147B) >> 19) & 0x007F_0000_007F);
+        let a_b_c_d_e_f_g_h =
+            ab_cd_ef_gh + (0x100 - 10) * (((ab_cd_ef_gh * 0x67) >> 10) & 0x000F_000F_000F_000F);
+        let i_j_k_l_m_n_o_p =
+            ij_kl_mn_op + (0x100 - 10) * (((ij_kl_mn_op * 0x67) >> 10) & 0x000F_000F_000F_000F);
+        let abcdefgh_tz = a_b_c_d_e_f_g_h.trailing_zeros();
+        let ijklmnop_tz = i_j_k_l_m_n_o_p.trailing_zeros();
+        let abcdefgh_bcd = a_b_c_d_e_f_g_h.swap_bytes();
+        let ijklmnop_bcd = i_j_k_l_m_n_o_p.swap_bytes();
+        let tz = if ijklmnop == 0 {
+            64 + abcdefgh_tz
+        } else {
+            ijklmnop_tz
+        } / 8;
+
+        buf.cast::<u64>().write_unaligned(ZERO);
+        buf.add(8).cast::<u64>().write_unaligned(ZERO);
+        buf.add(16).cast::<u64>().write_unaligned(ZERO);
+        buf.add(24).cast::<u64>().write_unaligned(ZERO);
+
+        ShortestAscii16 {
+            ascii16: (abcdefgh_bcd | ZERO, ijklmnop_bcd | ZERO),
+            dec_sig_len: select_unpredictable(up_down != 0, 15 - tz as u64, 15 + d17),
+        }
     }
 }
