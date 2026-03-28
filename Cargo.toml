@@ -1,0 +1,17 @@
+[package]
+name = "xjb"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+bench = false
+
+[[bench]]
+name = "bench"
+harness = false
+
+[dependencies]
+zmij = "1.0.21"
+
+[dev-dependencies]
+criterion = { version = "0.8.2", default-features = false }
